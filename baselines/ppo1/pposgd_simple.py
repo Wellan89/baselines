@@ -1,3 +1,4 @@
+import math
 from baselines.common import Dataset, explained_variance, fmt_row, zipsame
 from baselines import logger
 import baselines.common.tf_util as U
@@ -8,58 +9,117 @@ from baselines.common.mpi_moments import mpi_moments
 from mpi4py import MPI
 from collections import deque
 
+
+class EpisodeRunner:
+    def __init__(self, env):
+        self.env = env
+        self.prevacs = []
+        self.acs = []
+        self.vpreds = []
+        self.obs = [self.env.reset()]
+        self.rews = []
+        self.news = []
+        self.cur_ep_ret = 0.0
+        self.cur_ep_len = 0
+
+    @property
+    def ob(self):
+        return self.obs[-1]
+
+    @property
+    def prevac(self):
+        return self.acs[-1] if self.acs else self.env.action_space.sample()
+
+    @property
+    def terminated(self):
+        return self.news[-1] if self.news else False
+
+    def step(self, ac, vpred):
+        if self.terminated:
+            return True
+
+        ob, rew, new, _ = self.env.step(ac)
+        self.prevacs.append(self.prevac)  # before acs
+        self.acs.append(ac)
+        self.vpreds.append(vpred)
+        if not new:
+            self.obs.append(ob)
+        self.rews.append(rew)
+        self.news.append(new)
+        self.cur_ep_ret += rew
+        self.cur_ep_len += 1
+        return new
+
+
+def _create_episode_runners(env, ep_lens, timesteps):
+    episode_runners = [EpisodeRunner(env)]
+    env_unwrapped = env.unwrapped
+    if hasattr(env_unwrapped, 'create_new_instance'):
+        if not ep_lens:
+            n_episodes = 10
+        else:
+            ep_mean_length = sum(ep_lens) / len(ep_lens)
+            n_episodes = int(math.ceil(timesteps / ep_mean_length))
+        episode_runners += [EpisodeRunner(env_unwrapped.create_new_instance()) for _ in range(n_episodes - 1)]
+    return episode_runners
+
+
 def traj_segment_generator(pi, env, horizon, stochastic):
-    t = 0
-    ac = env.action_space.sample() # not used, just so we have the datatype
-    new = True # marks if we're on first timestep of an episode
-    ob = env.reset()
-
-    cur_ep_ret = 0 # return in current episode
-    cur_ep_len = 0 # len of current episode
-    ep_rets = [] # returns of completed episodes in this segment
-    ep_lens = [] # lengths of ...
-
-    # Initialize history arrays
-    obs = np.array([ob for _ in range(horizon)])
-    rews = np.zeros(horizon, 'float32')
-    vpreds = np.zeros(horizon, 'float32')
-    news = np.zeros(horizon, 'int32')
-    acs = np.array([ac for _ in range(horizon)])
-    prevacs = acs.copy()
-
+    ep_lens = []
     while True:
-        prevac = ac
-        ac, vpred = pi.act(stochastic, ob)
-        # Slight weirdness here because we need value function at time T
-        # before returning segment [0, T-1] so we get the correct
-        # terminal value
-        if t > 0 and t % horizon == 0:
-            yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
-                    "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
-                    "ep_rets" : ep_rets, "ep_lens" : ep_lens}
-            # Be careful!!! if you change the downstream algorithm to aggregate
-            # several of these batches, then be sure to do a deepcopy
-            ep_rets = []
-            ep_lens = []
-        i = t % horizon
-        obs[i] = ob
-        vpreds[i] = vpred
-        news[i] = new
-        acs[i] = ac
-        prevacs[i] = prevac
+        episode_runners = _create_episode_runners(env, ep_lens, horizon)
 
-        ob, rew, new, _ = env.step(ac)
-        rews[i] = rew
+        obs = np.array([episode_runners[0].ob for _ in range(horizon)])
+        rews = np.zeros(horizon, 'float32')
+        vpreds = np.zeros(horizon, 'float32')
+        news = np.zeros(horizon, 'int32')
+        ac = env.action_space.sample()
+        acs = np.array([ac for _ in range(horizon)])
+        prevacs = np.zeros_like(acs)
+        ep_lens = []
+        ep_rets = []
+        i = 0
+        vpred = 0.0
 
-        cur_ep_ret += rew
-        cur_ep_len += 1
-        if new:
-            ep_rets.append(cur_ep_ret)
-            ep_lens.append(cur_ep_len)
-            cur_ep_ret = 0
-            cur_ep_len = 0
-            ob = env.reset()
-        t += 1
+        while i < horizon:
+            if hasattr(pi, 'batch_act'):
+                ep_acs, ep_vpreds = pi.batch_act(stochastic, [ep_runner.ob for ep_runner in episode_runners])
+            else:
+                ep_acs, ep_vpreds = zip(*(pi.act(stochastic, ep_runner.ob) for ep_runner in episode_runners))
+            ep_news = [ep_runner.step(ac, vpred) for ep_runner, ac, vpred in zip(episode_runners, ep_acs, ep_vpreds)]
+
+            # Only take the episodes in the order they are in the runners list
+            # to avoid a bias in always only taking the shortest ones
+            first_not_terminated = None
+            for ep_idx, (ep_runner, ep_new) in enumerate(zip(episode_runners, ep_news)):
+                if not ep_new:
+                    first_not_terminated = ep_idx
+                    break
+                max_idx = min(i + len(ep_runner.obs), horizon)
+                ep_max_idx = max_idx - i
+                obs[i:max_idx] = ep_runner.obs[:ep_max_idx]
+                rews[i:max_idx] = ep_runner.rews[:ep_max_idx]
+                vpreds[i:max_idx] = ep_runner.vpreds[:ep_max_idx]
+                news[i:max_idx] = ep_runner.news[:ep_max_idx]
+                acs[i:max_idx] = ep_runner.acs[:ep_max_idx]
+                prevacs[i:max_idx] = ep_runner.prevacs[:ep_max_idx]
+                ep_rets.append(ep_runner.cur_ep_ret)
+                ep_lens.append(ep_runner.cur_ep_len)
+                i = max_idx
+                vpred = ep_runner.vpreds[ep_max_idx] if ep_max_idx < len(ep_runner.vpreds) else 0.0
+                if i == horizon:
+                    break
+
+            if first_not_terminated is None:
+                episode_runners = _create_episode_runners(env.unwrapped, ep_lens, horizon - i)
+            else:
+                episode_runners = episode_runners[first_not_terminated:]
+
+        # Be careful!!! if you change the downstream algorithm to aggregate
+        # several of these batches, then be sure to do a deepcopy
+        yield {"ob": obs, "rew": rews, "vpred": vpreds, "new": news,
+               "ac": acs, "prevac": prevacs, "nextvpred": vpred,
+               "ep_rets": ep_rets, "ep_lens": ep_lens}
 
 def add_vtarg_and_adv(seg, gamma, lam):
     """
